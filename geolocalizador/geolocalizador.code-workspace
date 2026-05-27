@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "Test1/testadx"
+		},
+		{
+			"name": "testgps",
+			"path": "testgps"
+		},
+		{
+			"name": "testsim",
+			"path": "testsim"
+		}
+	],
+	"settings": {}
+}
