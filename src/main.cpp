@@ -1,5 +1,8 @@
 ﻿#include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <TinyGPSPlus.h>
 
 #define GPS_RX_PIN 16
@@ -17,9 +20,45 @@ const uint8_t ADXL345_DATAX0 = 0x32;
 const float FALL_THRESHOLD_G = 2.5f;
 const float FREEFALL_THRESHOLD_G = 0.60f;
 const uint32_t FALL_DEBOUNCE_MS = 3000;
+const unsigned long LOCATION_SMS_INTERVAL_MS = 60000;
+const unsigned long FALL_SMS_INTERVAL_MS = 30000;
+
+const char* WIFI_SSID = "TU_SSID";
+const char* WIFI_PASSWORD = "TU_PASSWORD";
+const char* TWILIO_ACCOUNT_SID = "ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+const char* TWILIO_AUTH_TOKEN = "your_auth_token";
+const char* TWILIO_FROM_NUMBER = "+12345678901";
+const char* TWILIO_TO_NUMBER = "+10987654321";
 
 TinyGPSPlus gps;
 #define gpsSerial Serial2
+
+WiFiClientSecure secureClient;
+
+bool adxlDetected = false;
+bool gpsReady = false;
+unsigned long startTime = 0;
+unsigned long lastInitMsg = 0;
+unsigned long lastFallTime = 0;
+unsigned long lastAccelRead = 0;
+unsigned long lastStatusPrint = 0;
+unsigned long lastLocationSms = 0;
+unsigned long lastFallSms = 0;
+
+uint32_t totalCharsReceived = 0;
+uint32_t totalSentencesReceived = 0;
+uint32_t loopCount = 0;
+uint32_t unknownSentences = 0;
+uint32_t ggaSentences = 0;
+uint32_t rmcSentences = 0;
+uint32_t gsaSentences = 0;
+uint32_t gssSentences = 0;
+uint32_t gllSentences = 0;
+uint32_t gsvSentences = 0;
+uint32_t vtgSentences = 0;
+bool lastFixValid = false;
+unsigned long lastFixTime = 0;
+String nmeaLine = "";
 
 bool adxlDetected = false;
 bool gpsReady = false;
@@ -43,6 +82,132 @@ uint32_t vtgSentences = 0;
 bool lastFixValid = false;
 unsigned long lastFixTime = 0;
 String nmeaLine = "";
+
+String urlEncode(const String &value) {
+  String encoded = "";
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += '+';
+    } else {
+      char buf[4];
+      sprintf(buf, "%%%02X", (uint8_t)c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+
+bool isSmsConfigured() {
+  return strlen(WIFI_SSID) > 0 && strlen(WIFI_PASSWORD) > 0 &&
+         strlen(TWILIO_ACCOUNT_SID) > 2 && strlen(TWILIO_AUTH_TOKEN) > 2 &&
+         strlen(TWILIO_FROM_NUMBER) > 5 && strlen(TWILIO_TO_NUMBER) > 5;
+}
+
+void connectWiFi() {
+  Serial.printf("Conectando a WiFi %s...\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi conectado, IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("No se pudo conectar a WiFi.");
+  }
+}
+
+bool ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  connectWiFi();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool sendSms(const String &body) {
+  if (!isSmsConfigured()) {
+    Serial.println("SMS no configurado: define credenciales Twilio y WiFi.");
+    return false;
+  }
+  if (!ensureWiFiConnected()) {
+    Serial.println("SMS cancelado: WiFi no conectado.");
+    return false;
+  }
+
+  secureClient.setInsecure();
+  HTTPClient http;
+  String url = String("https://api.twilio.com/2010-04-01/Accounts/") + TWILIO_ACCOUNT_SID + "/Messages.json";
+  http.begin(secureClient, url);
+  http.setAuthorization(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String payload = "To=" + urlEncode(TWILIO_TO_NUMBER);
+  payload += "&From=" + urlEncode(TWILIO_FROM_NUMBER);
+  payload += "&Body=" + urlEncode(body);
+
+  int httpCode = http.POST(payload);
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+    Serial.println("SMS enviado correctamente.");
+    http.end();
+    return true;
+  }
+
+  Serial.printf("Error SMS: %d -> %s\n", httpCode, http.errorToString(httpCode).c_str());
+  String response = http.getString();
+  Serial.println(response);
+  http.end();
+  return false;
+}
+
+void sendLocationSms() {
+  if (millis() - lastLocationSms < LOCATION_SMS_INTERVAL_MS) return;
+  if (!gps.location.isValid()) return;
+
+  String body = "Ubicacion: ";
+  body += String(gps.location.lat(), 6);
+  body += ",";
+  body += String(gps.location.lng(), 6);
+  if (gps.speed.isValid()) {
+    body += " Vel:";
+    body += String(gps.speed.kmph(), 1);
+    body += "km/h";
+  }
+  body += " #AlertaGPS";
+  if (sendSms(body)) {
+    lastLocationSms = millis();
+  }
+}
+
+void sendFallSms() {
+  if (millis() - lastFallSms < FALL_SMS_INTERVAL_MS) return;
+  if (!gps.location.isValid()) {
+    Serial.println("Caida detectada pero no hay fix GPS valido para enviar SMS.");
+    return;
+  }
+
+  String body = "ALERTA CAIDA! Ubicacion: ";
+  body += String(gps.location.lat(), 6);
+  body += ",";
+  body += String(gps.location.lng(), 6);
+  body += " Hora UTC: ";
+  if (gps.time.isValid()) {
+    body += String(gps.time.hour());
+    body += ":";
+    body += String(gps.time.minute());
+    body += ":";
+    body += String(gps.time.second());
+  } else {
+    body += "desconocida";
+  }
+  if (sendSms(body)) {
+    lastFallSms = millis();
+  }
+}
 
 void writeRegister(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(ADXL345_ADDR);
@@ -116,6 +281,7 @@ void printADXLData() {
   if (detectFall(xg, yg, zg) && millis() - lastFallTime > FALL_DEBOUNCE_MS) {
     lastFallTime = millis();
     Serial.println("*** ALERTA: POSIBLE CAÍDA DETECTADA ***");
+    sendFallSms();
   }
 }
 
@@ -197,6 +363,8 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
 
+  connectWiFi();
+
   Serial.println("Iniciando ADXL345...");
   adxlDetected = detectADXL345();
   if (adxlDetected) {
@@ -257,6 +425,8 @@ void loop() {
     }
     lastStatusPrint = millis();
   }
+
+  sendLocationSms();
 
   if (!isColdStart && !gpsReady && gps.charsProcessed() < 10) {
     Serial.println("\n⚠ ERROR: GPS no responde. Revisa conexiones, alimentación y baudrate.");
