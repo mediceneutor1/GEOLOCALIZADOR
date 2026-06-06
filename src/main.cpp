@@ -540,13 +540,13 @@ void sendFallSms() {
  * Se ejecuta de forma cíclica e independiente en segundo plano, enviando un mensajeSMS estructurado 
  * con el estado general de salud del sistema de telemetría y el enlace cartográfico de Google Maps.
  */
-void sendLocationSms() {
-  if (millis() - lastLocationSms < LOCATION_SMS_INTERVAL_MS) {
-    return;
-  }
-  lastLocationSms = millis();
+/**
+ * @brief Rutina secuencial de despacho periódico optimizada para el lazo de 2 minutos.
+ */
+void sendLocationSms2Min() {
+  lastLocationSms = millis(); // Sincroniza el estampa de tiempo global
 
-  String body = "Estado ESP32 de Tesis. Ubicacion: ";
+  String body = "Estado del paciente Ubicacion: ";
   if (gps.location.isValid()) {
     body += "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
   } else if (internetLocationValid) {
@@ -637,27 +637,26 @@ void loop() {
 
   procesarAcelerometro();
 
-  // Orquestador periódico de impresión de telemetría por consola general cada 5 segundos
-  if (millis() - lastStatusPrint >= 5000UL) {
-    displayLocationInfo();
-    displayGPSStatus();
-    Serial.print("Última alerta caída: ");
-    if (lastFallTime == 0UL) {
-      Serial.println("Ninguna");
-    } else {
-      Serial.print((millis() - lastFallTime) / 1000UL);
-      Serial.println(" segundos atrás");
+  // =======================================================================
+  // LAZO DE CONTROL UNIFICADO: ACTUALIZACIÓN Y DESPACHO (CADA 2 MINUTOS)
+  // =======================================================================
+  if (millis() - lastLocationSms >= LOCATION_SMS_INTERVAL_MS) {
+    
+    // 1. Si no hay Fix satelital, forzamos la triangulación por WiFi antes del SMS
+    if (!gps.location.isValid() && !isColdStart) {
+      Serial.println("\n[Muestreo 2min] GPS sin señal óptima. Sincronizando coordenadas con Unwired Labs...");
+      fetchInternetLocation(); 
     }
-    lastStatusPrint = millis();
+    
+    // 2. Ejecutamos el envío del SMS que ahora sí transmitirá la posición real e instantánea
+    Serial.println("[Muestreo 2min] Despachando reporte periódico vía Twilio...");
+    sendLocationSms2Min(); 
   }
 
-  sendLocationSms();
-
-  // Supervisor de integridad del canal físico UART (Alertas por falla de cableado lógicas posteriores al Cold Start)
+  // Alerta de falla física de cableado del GPS
   if (!isColdStart && totalCharsReceived < 10) {
     Serial.println("\n⚠ ALERTA: No llegan datos lógicos del GPS. Revisa RX/TX.");
     delay(1000); 
   }
-
-  delay(10); // Retraso de guarda mínimo de estabilidad estructural del hilo principal
+delay(10); 
 }
